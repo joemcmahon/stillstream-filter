@@ -1,0 +1,220 @@
+use strict;
+use warnings;
+
+use File::Find::Rule;
+use JSON;
+use File::Slurp;
+use Data::Dumper;
+use MIME::Base64 qw(decode_base64);
+use HTML::FormatText;
+use HTML::TreeBuilder;
+
+# Padding used by the original artists list file.
+use constant PAD => 77;
+
+# Dispatch table.
+my $run = {
+    old_style => \&old_style,
+    new_style => \&new_style,
+    discard   => sub { '' },
+};
+
+my @results;
+
+# Added a specific label to all the signup emails on GMail.
+# Used GMVault --type custom --gm-query 'specific_label' to pull just those.
+# Find the .meta files for all the pulled mails.
+foreach my $file (
+    File::Find::Rule->file()
+        ->name("*.meta")
+        ->in("$ENV{HOME}/gmvault-db") ) {
+    my $lines = read_file($file);
+    my $hash  = decode_json $lines;
+    my $type  = decide_type($hash);
+
+    # May be one or more lines.
+    push @results, $run->{$type}->($file);
+}
+
+# Clean up the old artist list. This came from a database dump, and some
+# artist/project names were NULL. Fix those. Make these records look just
+# like the ones we're generating here.
+my @old_artists = read_file('./artist_list.txt');
+for my $artist (@old_artists) {
+    my($person, $act) = ($artist =~ /\| (.*?) \| (.*?) \|/ );
+    next unless $person;
+    $person =~ s/\s+$//;
+    $act =~ s/\s+$//;
+    $act = $person if $act eq 'NULL';
+    my $output = format_line($person, $act);
+    push @results, format_line($person, $act);
+}
+
+# Clean up the output by combining the old and new, sorting, and dropping
+# dupicates.
+open my $cleanpipe, "|-", "sort | uniq" or die "Can't open pipe: $!\n";
+print $cleanpipe @results;
+
+# Match mails we know how to process and pass them to the appropriate sub.
+sub decide_type {
+    my($hash) = @_; return $hash->{subject} eq 'New Artist Release'
+        ? 'new_style' : $hash->{subject} =~ 'An artist has signed the StillStream agreement'
+        ? 'old_style' : 'discard';
+}
+
+# Read the compressed email file. Clean up artifacts.
+sub zread {
+    my $filename = shift;
+    $DB::single = 1 unless $filename =~ s/meta/eml.gz/;
+    my @content = `gzcat $filename`;
+    local $_;
+    for (@content) {
+        s/=09=09//g;
+    }
+    return @content;
+}
+
+# New style signup letter.
+# HTML, so we need to use HTML::FormatText to clean off the tags.
+sub new_style {
+    my $filename = shift;
+    my @lines = zread($filename);
+    my $tree = HTML::TreeBuilder->new;
+    $tree->parse(join "",@lines);
+    $tree->eof;
+    my $formatter = HTML::FormatText->new(leftmargin => 0, rightmargin => 132);
+    my $text = $formatter->format($tree);
+
+    # Render it back into individual lines.
+    @lines = split /\n/, $text;
+
+    # Drop everything to the first blank line (mail body).
+    shift @lines while $lines[0] ne '';
+    shift @lines;
+
+    my %capture;
+    my $item;
+
+    # State machine to read the output from FormatText. It doesn't handle
+    # tables well - you get a cell's (possibly multi-line) content, then a
+    # blank line, then then next cell, and so on.
+
+    # Our table is two columns, so we have to capture an always-one-line
+    # key, then a possibly-multiple-line value. We handle this by setting up
+    # a state machine to check each line's contents, then do the proper action.
+    my($key, $value);
+    my $state = "start";
+
+    my $state_machine = {
+        # Stay in start until we see a non-null line. Capture that as the
+        # key and go to the 'key' state.
+        start => [
+            sub { $_[0] eq '' and $state = 'start' },
+            sub { $_[0] ne '' and do { $key = $_[0]; $state = 'key'} },
+        ],
+        # Stay in key state till we see another line. Capture that into the value
+        # and go into the value state.
+        key => [
+            sub { $_[0] eq '' and $state = 'key' },
+            sub { $_[0] ne '' and do { $value .= "\n" . $_[0]; $state = 'value' } },
+        ],
+        # If we see a null line, we've finished capturing the value; save it in a
+        # hash using the previously-captured key, clear the value, and return to 'start'.
+        # A non-null line is tacked on, separated by a newline. (Note that we always do
+        # this, so the capture cleans off the first one.)
+        value => [
+            sub { $_[0] eq '' and do { $value = substr($value, 1); $capture{$key} = $value; $value = ''; $state = 'start' } },
+            sub { $_[0] ne '' and do { $value .= "\n" . $_[0]; $state = 'value' } },
+        ],
+    };
+
+    # Run the state machine: For each line, run all the applicable checks
+    # in order. The transitions will handle all the actions with their side effects.
+    foreach my $line (@lines) {
+        for my $check ( @{ $state_machine->{$state} } ) {
+            $check->($line)
+        }
+    }
+
+    # The format was updated at one point to format the output more readably for
+    # humans; make it more understandable for the machine again. 
+    $capture{Name} = $capture{'Step 2: Name'} if $capture{'Step 2: Name'};
+
+    # Make sure we have no undefined data in the fields that matter to us.
+    $capture{Name} = $capture{'Artist/Project Name'} unless $capture{Name};
+    $capture{'Artist/Project Name'} = $capture{Name} unless $capture{'Artist/Project Name'};
+    $DB::single = 1 unless defined  $capture{'Artist/Project Name'} && $capture{Name};
+
+    # Format the line consistently and return it.
+    format_line($capture{Name}, $capture{'Artist/Project Name'});
+}
+
+# Several different formats for old-style mails.
+sub old_style {
+    my $filename = shift;
+    my @lines = zread($filename);
+    return _old_style_filter(@lines);
+}
+
+sub _old_style_filter {
+    my @lines = @_;
+    local $_;
+    my $capture_base64;
+    my @base64;
+    my @result;
+    while (defined($_ = shift @lines)) {
+        # Some have Windows newlines. Get rid of those.
+        s/\cM\cJ//;
+
+        # The oldest format was "key: [value]", one per line. If we see the
+        # diagnostic tag for that format, just process the rest of the file
+        # that way.
+        return old_plain_text(@lines) if /^An artist has digitally signed/;
+
+        # Some of them ended up forwarded as attachments, so they have to be
+        # decoded from base64 then parsed. There were typically several different sections
+        # in these; we need to capture each one, then decide which one's good.
+        if (/Content-Transfer-Encoding: base64/) {
+            $capture_base64++;
+            next;
+        }
+        if ($capture_base64) {
+            if (/^$/ and @base64) {
+                my $text = decode_base64(join '',@base64);
+                push @result, _old_style_filter(split /\n/, $text);
+                $capture_base64 = 0;
+                @base64 = ();
+            }
+            else {
+              push @base64, $_;
+            }
+        }
+    }
+    return @result;
+}
+
+sub old_plain_text {
+    my @lines = @_;
+    shift @lines;
+    my %capture;
+    while ($_ = shift @lines) {
+        # Clean off Windows newlines, capture "key: [value]" pairs.
+        s/\cM\cJ//;
+        my($key, $value) = (/^(.*?): \[(.*)\]\s*$/);
+        next unless defined $key;
+        $key =~ s/^> //;
+        $capture{lc($key)} = $value;
+    }
+
+    # Make sure we have name and project name both; format and return.
+    $capture{'artist name'} = $capture{'full name'} unless $capture{'artist name'};
+    $capture{'full name'} = $capture{'artist name'} unless $capture{'full name'};
+    format_line($capture{'artist name'}, $capture{'full name'});
+}
+
+sub format_line {
+    my($artist, $name) = @_;
+    return "| ",  substr($artist . " " x PAD, 0, PAD - 1),
+          " | ", substr($name   . " " x PAD, 0, PAD - 1),
+          " |\n";
+}
